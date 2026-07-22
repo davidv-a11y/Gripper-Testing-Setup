@@ -1,0 +1,87 @@
+# Initial python code to control the motor with a fake, generated potentiometer outputs
+import time
+import math
+import serial
+from damiao_motor import DamiaoMotor, CTRL_MODE_MIT
+
+# Change this if your Arduino appears somewhere else
+ARDUINO_PORT = "/dev/ttyACM0"
+BAUD = 115200
+
+# Start very small for safety
+MAX_ANGLE_DEG = 10.0
+MAX_ANGLE_RAD = math.radians(MAX_ANGLE_DEG)
+
+# Low gains for first test
+KP = 3.0
+KD = 0.15
+
+motor = DamiaoMotor("DM-J4310", can_id=0x01, channel="can0")
+arduino = serial.Serial(ARDUINO_PORT, BAUD, timeout=0.1)
+
+def map_pot_to_offset(value):
+    """
+    Maps Arduino analog value 0-1023 to angle offset:
+    0       -> -MAX_ANGLE_RAD
+    512     -> 0
+    1023    -> +MAX_ANGLE_RAD
+    """
+    value = max(0, min(1023, value))
+    normalized = (value - 512) / 512.0
+    return normalized * MAX_ANGLE_RAD
+
+try:
+    print("Disabling motor...")
+    motor.disable()
+    time.sleep(0.2)
+
+    print("Setting MIT mode...")
+    motor.set_control_mode(CTRL_MODE_MIT)
+    time.sleep(0.2)
+
+    print("Reading current position...")
+    center_pos, _, _ = motor.read_state()
+    print(f"Center position: {center_pos:.4f} rad")
+
+    print("Enabling motor...")
+    motor.enable()
+    time.sleep(0.2)
+
+    print("Potentiometer control active.")
+    print("Twist pot to command position. Ctrl+C to stop.")
+
+    while True:
+        line = arduino.readline().decode(errors="ignore").strip()
+        if not line:
+            continue
+        try:
+            pot_value = int(line)
+        except ValueError:
+            continue
+
+        offset = map_pot_to_offset(pot_value)
+        target_pos = center_pos + offset
+
+        motor.send_mit(
+            position=target_pos,
+            velocity=0.0,
+            kp=KP,
+            kd=KD,
+            torque=0.0
+        )
+
+        print(
+            f"pot={pot_value:4d}  "
+            f"target={target_pos:+.3f} rad  "
+            f"offset={math.degrees(offset):+.1f} deg"
+        )
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    print("\nStopped by user.")
+
+finally:
+    print("Disabling motor...")
+    motor.disable()
+    motor.close()
+    arduino.close()
