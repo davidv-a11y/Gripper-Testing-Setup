@@ -1,0 +1,179 @@
+#include <FlexCAN_T4.h>
+#include <math.h>
+#include <string.h>
+
+FlexCAN_T4FD<CAN3, RX_SIZE_256, TX_SIZE_16> canFD;
+
+const uint32_t MOTOR_ID = 0x08;
+const int POT_PIN = A0;
+
+// MIT-style limits
+const float P_MIN  = -12.5f;
+const float P_MAX  =  12.5f;
+const float V_MIN  = -30.0f;
+const float V_MAX  =  30.0f;
+const float KP_MIN =   0.0f;
+const float KP_MAX = 500.0f;
+const float KD_MIN =   0.0f;
+const float KD_MAX =   5.0f;
+const float T_MIN  = -10.0f;
+const float T_MAX  =  10.0f;
+
+// Safe initial motion range: about ±23 degrees
+float positionSpanRad = 0.40f;
+
+// Gentle gains
+float kp = 5.0f;
+float kd = 0.20f;
+
+bool motorRunning = false;
+
+uint16_t float_to_uint(float x, float x_min, float x_max, int bits) {
+	if (x < x_min) x = x_min;
+	if (x > x_max) x = x_max;
+	float span = x_max - x_min;
+	float offset = x - x_min;
+	return (uint16_t)((offset * ((1UL << bits) - 1)) / span);
+}
+
+void sendCANFD(uint32_t id, const uint8_t data[8]) {
+	CANFD_message_t msg;
+	memset(&msg, 0, sizeof(msg));
+
+	msg.id = id;
+	msg.len = 8;
+	msg.flags.extended = 0;
+	msg.edl = 1;
+	msg.brs = 1;
+
+	for (int i = 0; i < 8; i++) {
+		msg.buf[i] = data[i];
+	}
+
+	canFD.write(msg);
+}
+
+void enableMotor() {
+	uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
+	sendCANFD(MOTOR_ID, data);
+	Serial.println("Enable command sent");
+}
+
+void disableMotor() {
+	uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
+	sendCANFD(MOTOR_ID, data);
+	Serial.println("Disable command sent");
+}
+
+void sendMIT(float p_des, float v_des, float kp_cmd, float kd_cmd, float t_ff) {
+	uint16_t p_int = float_to_uint(p_des, P_MIN, P_MAX, 16);
+	uint16_t v_int = float_to_uint(v_des, V_MIN, V_MAX, 12);
+	uint16_t kp_int = float_to_uint(kp_cmd, KP_MIN, KP_MAX, 12);
+	uint16_t kd_int = float_to_uint(kd_cmd, KD_MIN, KD_MAX, 12);
+	uint16_t t_int = float_to_uint(t_ff, T_MIN, T_MAX, 12);
+
+	uint8_t data[8];
+	data[0] = p_int >> 8;
+	data[1] = p_int & 0xFF;
+	data[2] = v_int >> 4;
+	data[3] = ((v_int & 0xF) << 4) | (kp_int >> 8);
+	data[4] = kp_int & 0xFF;
+	data[5] = kd_int >> 4;
+	data[6] = ((kd_int & 0xF) << 4) | (t_int >> 8);
+	data[7] = t_int & 0xFF;
+
+	sendCANFD(MOTOR_ID, data);
+}
+
+float readPotTargetPosition() {
+	int raw = analogRead(POT_PIN); // 0 to 4095
+	float normalized = ((float)raw - 2047.5f) / 2047.5f; // about -1 to +1
+	if (normalized < -1.0f) normalized = -1.0f;
+	if (normalized > 1.0f) normalized = 1.0f;
+	return normalized * positionSpanRad;
+}
+
+void printRXFrames() {
+	CANFD_message_t rx;
+	while (canFD.read(rx)) {
+		Serial.print("RX ID: 0x");
+		Serial.print(rx.id, HEX);
+		Serial.print(" DATA: ");
+		for (int i = 0; i < rx.len; i++) {
+			if (rx.buf[i] < 0x10) Serial.print("0");
+			Serial.print(rx.buf[i], HEX);
+			Serial.print(" ");
+		}
+		Serial.println();
+	}
+}
+
+void setup() {
+	Serial.begin(115200);
+	delay(1500);
+	Serial.println("Pot controls motor position");
+	Serial.println("Type 'e' + Enter to enable motor");
+	Serial.println("Type 's' + Enter to stop/disable motor");
+
+	analogReadResolution(12);
+
+	canFD.begin();
+	CANFD_timings_t config;
+	config.clock = CLK_80MHz;
+	config.baudrate = 1000000;
+	config.baudrateFD = 5000000;
+	config.propdelay = 190;
+	config.bus_length = 1;
+	config.sample = 75;
+	canFD.setBaudRate(config);
+
+	Serial.println("CAN FD initialized.");
+	disableMotor();
+}
+
+void loop() {
+	if (Serial.available()) {
+		char c = Serial.read();
+
+		if (c == 'e') {
+			Serial.println("Enabling motor...");
+			enableMotor();
+			delay(200);
+			motorRunning = true;
+		}
+
+		if (c == 's') {
+			Serial.println("Stopping motor...");
+			sendMIT(0.0f, 0.0f, 0.0f, 0.2f, 0.0f);
+			delay(100);
+			disableMotor();
+			motorRunning = false;
+		}
+	}
+
+	float targetPos = readPotTargetPosition();
+	if (motorRunning) {
+		sendMIT(
+			targetPos, // desired position from potentiometer
+			0.0f,      // desired velocity
+			kp,        // position gain
+			kd,        // damping
+			0.0f       // feedforward torque
+		);
+	}
+
+	static unsigned long lastPrint = 0;
+	if (millis() - lastPrint > 200) {
+		int raw = analogRead(POT_PIN);
+		Serial.print("pot raw = ");
+		Serial.print(raw);
+		Serial.print("  targetPos = ");
+		Serial.print(targetPos, 3);
+		Serial.print(" rad  running = ");
+		Serial.println(motorRunning ? "yes" : "no");
+		lastPrint = millis();
+	}
+
+	printRXFrames();
+	delay(10); // 100 Hz command rate
+}
