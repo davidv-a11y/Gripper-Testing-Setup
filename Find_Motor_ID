@@ -1,0 +1,139 @@
+#include <FlexCAN_T4.h>
+#include <string.h>
+
+FlexCAN_T4FD<CAN3, RX_SIZE_256, TX_SIZE_16> canFD;
+
+// Scan range
+const uint8_t ID_MIN = 0x01;
+const uint8_t ID_MAX = 0x20;
+
+// Timing
+const unsigned long SCAN_INTERVAL_MS = 250;
+unsigned long lastScanTime = 0;
+
+uint8_t currentID = ID_MIN;
+
+int sendCANFD(uint32_t id, const uint8_t data[8]) {
+  CANFD_message_t msg;
+  memset(&msg, 0, sizeof(msg));
+
+  msg.id = id;
+  msg.len = 8;
+  msg.flags.extended = 0;
+  msg.edl = 1;
+  msg.brs = 1;
+
+  for (int i = 0; i < 8; i++) {
+    msg.buf[i] = data[i];
+  }
+
+  return canFD.write(msg);
+}
+
+void sendRegisterRead(uint8_t motorID) {
+  // Damiao register read style packet.
+  // This is the one that previously gave replies like:
+  // TX ID 0x7FF DATA: 08 00 33 08 00 00 00 00
+  uint8_t data[8] = {
+    motorID,
+    0x00,
+    0x33,
+    0x08,
+    0x00,
+    0x00,
+    0x00,
+    0x00
+  };
+
+  int result = sendCANFD(0x7FF, data);
+
+  Serial.print("Scanning motor ID 0x");
+  Serial.print(motorID, HEX);
+  Serial.print("  TX result = ");
+  Serial.println(result);
+}
+
+void printRXFrames() {
+  CANFD_message_t rx;
+
+  while (canFD.read(rx)) {
+    Serial.print("RX ID: 0x");
+    Serial.print(rx.id, HEX);
+
+    Serial.print("  LEN: ");
+    Serial.print(rx.len);
+
+    Serial.print("  DATA:");
+    for (int i = 0; i < rx.len; i++) {
+      Serial.print(" ");
+      if (rx.buf[i] < 0x10) Serial.print("0");
+      Serial.print(rx.buf[i], HEX);
+    }
+
+    Serial.println();
+
+    if (rx.id >= 0x10 && rx.id <= 0x30) {
+      uint8_t possibleMotorID = rx.id - 0x10;
+
+      Serial.print(">>> Possible motor ID = 0x");
+      Serial.print(possibleMotorID, HEX);
+      Serial.print("  decimal ");
+      Serial.println(possibleMotorID);
+    }
+
+    if (rx.len > 0) {
+      Serial.print(">>> Data byte 0 also suggests motor ID = 0x");
+      Serial.print(rx.buf[0], HEX);
+      Serial.print("  decimal ");
+      Serial.println(rx.buf[0]);
+    }
+
+    Serial.println();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println("Damiao motor ID scanner");
+  Serial.println("This does not enable or move the motor.");
+  Serial.println("Expected reply ID is usually 0x10 + motor ID.");
+  Serial.println();
+
+  canFD.begin();
+
+  CANFD_timings_t config;
+  config.clock = CLK_80MHz;
+  config.baudrate = 1000000;
+  config.baudrateFD = 5000000;
+  config.propdelay = 190;
+  config.bus_length = 1;
+  config.sample = 75;
+
+  canFD.setBaudRate(config);
+
+  Serial.println("CAN FD initialized.");
+  Serial.println("Starting scan...");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  printRXFrames();
+
+  if (now - lastScanTime >= SCAN_INTERVAL_MS) {
+    sendRegisterRead(currentID);
+
+    currentID++;
+
+    if (currentID > ID_MAX) {
+      currentID = ID_MIN;
+      Serial.println("---- restarting scan ----");
+    }
+
+    lastScanTime = now;
+  }
+
+  delay(10);
+}
